@@ -24,8 +24,6 @@
   @media (max-width:600px){ .leaflet-bottom.leaflet-left .legend{margin-bottom:24px} }
   .dot{width:12px;height:12px;border-radius:50%;border:2px solid #fff;
     box-shadow:0 0 0 1px rgba(0,0,0,.15);flex:none;box-sizing:content-box}
-  .dot.small{width:7px;height:7px;margin:0 2.5px}
-  .dot.hollow{background:#fff;box-shadow:none;border-color:#1f2d24}
   .legend .note{color:#56645b;font-size:11.5px;margin-top:6px}
   .legend .shapes{display:flex;gap:12px;margin-top:6px;padding-top:6px;border-top:1px solid #e3e9e4}
   .legend .ramp{display:flex;flex-direction:column;gap:2px;flex:1 1 170px;min-width:170px}
@@ -53,6 +51,7 @@
   /* "!" badge for newly planted trees that are overdue */
   .flag{display:inline-block;flex:none;width:16px;height:16px;border-radius:50%;background:#1f2d24;color:#fff;
     font:700 11px/16px system-ui,-apple-system,sans-serif;text-align:center;box-shadow:0 0 0 1.5px #fff}
+  .flag.tiny{width:11px;height:11px;font-size:8px;line-height:11px;box-shadow:0 0 0 1px #fff}
   .flag.sm{width:14px;height:14px;font-size:10px;line-height:14px;margin-right:3px;vertical-align:-2px}
   .cl{position:relative;width:34px;height:34px}
   .cl .flag{position:absolute;top:-6px;right:-8px;width:auto;min-width:16px;padding:0 4px;border-radius:8px;
@@ -178,6 +177,18 @@ if (['actual', 'in', 'out'].indexOf(preview.season) < 0) preview.season = 'actua
 if (['actual', 'on', 'off'].indexOf(preview.drought) < 0) preview.drought = 'actual';
 var showPreview = DEMO_CONTROLS || params.has('preview') || params.has('drought');
 
+// Every tree is drawn as its own dot. Set CLUSTER_TREES to true to go back to
+// grouping nearby trees into numbered circles until you zoom in. Links with
+// ?cluster=on or ?cluster=off try either way without changing this.
+var CLUSTER_TREES = false;
+var clustered = params.has('cluster') ? params.get('cluster') !== 'off' : CLUSTER_TREES;
+
+// Separate dots grow as you zoom in, so the overview isn't one solid smear
+function dotRadius(zoom) {
+  return zoom >= 17 ? 10 : zoom >= 16 ? 8 : zoom >= 15 ? 6 : zoom >= 14 ? 5 : 4;
+}
+function dotWeight(zoom) { return zoom >= 16 ? 2.5 : zoom >= 14 ? 1.5 : 1; }
+
 function previewing() { return preview.season !== 'actual' || preview.drought !== 'actual'; }
 
 // Copy of the data as it would look in the previewed season and drought mode
@@ -218,9 +229,14 @@ function load() {
   status.innerHTML = 'Loading trees\u2026';
   fetch(DATA_URL + '?view=data')
     .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-    .then(function(d) { status.hidden = true; data = d; draw(); })
-    .catch(function() {
-      status.innerHTML = 'Couldn\u2019t load the tree data. <button type="button" id="retry">Try again</button>';
+    .then(function(d) {
+      // The script explains problems with the sheet, such as a missing header
+      if (d.error) { var err = new Error(d.error); err.fromSheet = true; throw err; }
+      status.hidden = true; data = d; draw();
+    })
+    .catch(function(err) {
+      status.innerHTML = 'Couldn\u2019t load the tree data' + (err && err.fromSheet ? ': ' + esc(err.message) : '.') +
+        ' <button type="button" id="retry">Try again</button>';
       document.getElementById('retry').onclick = load;
     });
 }
@@ -229,7 +245,7 @@ function draw() {
   var d = applyPreview(data);
   var pts = d.points;
   var info = d.info;
-  info.season = info.season || 'May\u2013Sep';
+  info.season = info.season || '1 Apr\u201315 Sep';
   info.focus = (params.get('tree') || '').trim().toLowerCase();
   var offSeason = info.inSeason === false;
   var labels = {ok:'Watered recently', never:'No watering recorded',
@@ -263,7 +279,12 @@ function draw() {
   }
 
   var rank = {amey:-2, rest:-1, ok:0, soon:1, never:2, overdue:3};
-  var cluster = L.markerClusterGroup({
+  // Trees are drawn in this order, so where dots overlap the most urgent is on top
+  var order = pts.slice().sort(function(a, b){
+    return rank[key(a)] - rank[key(b)] || (a.urgency || 0) - (b.urgency || 0);
+  });
+  // Every tree as its own dot, or grouped into numbered circles if CLUSTER_TREES is on
+  var cluster = clustered ? L.markerClusterGroup({
     maxClusterRadius: 45,
     // A cluster takes the colour of its most urgent tree
     // and a "!" badge counting its newly planted overdue trees
@@ -284,34 +305,57 @@ function draw() {
         className: '', iconSize: [34,34]
       });
     }
-  });
+  }) : null;
+  var layer = cluster || L.featureGroup();
 
-  var bounds = [], markers = {}, badges = [];
-  pts.forEach(function(p){
-    // Amey trees are smaller circles
+  // All dots are the same size: 10 px when grouped, or by zoom when separate
+  var zoom = map.getZoom(); // undefined before the first view is set
+  function radiusNow() { return clustered ? 10 : dotRadius(zoom || 13); }
+  function weightNow() { return clustered ? 2.5 : dotWeight(zoom || 13); }
+  // The "!" badge sits on the dot's top-right edge, smaller when zoomed out so
+  // it doesn't hide the dots around it
+  function badgeIcon() {
+    var r = radiusNow() - 1, small = !clustered && (zoom || 13) < 15, s = small ? 11 : 16;
+    return L.divIcon({className:'', iconSize:[s,s], iconAnchor:[s / 2 - r, s / 2 + r],
+      html:'<span class="flag' + (small ? ' tiny' : '') + '">!</span>'});
+  }
+
+  var bounds = [], markers = {}, badges = [], dots = [];
+  order.forEach(function(p){
     var flag = flagged(p);
-    var m = L.circleMarker([p.lat, p.lng], {radius: p.amey ? 6 : 10, weight: p.amey ? 2 : 2.5,
+    var m = L.circleMarker([p.lat, p.lng], {radius: radiusNow(), weight: weightNow(),
       color:'#fff', fillColor: colourFor(key(p), p.urgency), fillOpacity:1, _status: key(p), _urgency: p.urgency,
       _flag: flag});
     m.bindPopup(popupHtml(p));
-    cluster.addLayer(m);
+    layer.addLayer(m);
     markers[p.id] = m;
+    dots.push(m);
     bounds.push([p.lat, p.lng]);
     if (flag) {
-      // Badge sits on the dot's top-right edge; tapping it opens the tree
-      var r = p.amey ? 6 : 9;
+      // Tapping the badge opens the tree
       var b = L.marker([p.lat, p.lng], {keyboard:false, zIndexOffset:1000, title:'Newly planted and overdue',
-        icon: L.divIcon({className:'', iconSize:[16,16], iconAnchor:[8 - r, 8 + r], html:'<span class="flag">!</span>'})});
+        icon: badgeIcon()});
       b.on('click', function(){ m.openPopup(); });
       b._tree = m;
       badges.push(b);
     }
   });
-  map.addLayer(cluster);
-  drawn.push(cluster);
+  map.addLayer(layer);
+  drawn.push(layer);
+
+  // Separate dots and their badges resize as the zoom changes
+  function resizeDots() {
+    if (clustered || map.getZoom() === zoom) return;
+    zoom = map.getZoom();
+    dots.forEach(function(m){ m.setRadius(radiusNow()); m.setStyle({weight: weightNow()}); });
+    badges.forEach(function(b){ b.setIcon(badgeIcon()); });
+  }
+  map.on('zoomend', resizeDots);
+  drawn.push({remove: function(){ map.off('zoomend', resizeDots); }});
 
   // Tree badges show only while their tree is shown on its own (not inside a
-  // cluster or fanned out); clusters carry their own badge
+  // cluster or fanned out); clusters carry their own badge. Separate dots are
+  // always shown on their own.
   var badgeLayer = L.layerGroup().addTo(map), spread = [];
   function updateBadges() {
     badges.forEach(function(b){
@@ -323,9 +367,11 @@ function draw() {
     });
   }
   function hideBadges() { badgeLayer.clearLayers(); }
-  cluster.on('animationend', updateBadges);
-  cluster.on('spiderfied', function(e){ spread = e.markers; updateBadges(); });
-  cluster.on('unspiderfied', function(){ spread = []; updateBadges(); });
+  if (cluster) {
+    cluster.on('animationend', updateBadges);
+    cluster.on('spiderfied', function(e){ spread = e.markers; updateBadges(); });
+    cluster.on('unspiderfied', function(){ spread = []; updateBadges(); });
+  }
   map.on('zoomstart', hideBadges);
   map.on('moveend', updateBadges);
   drawn.push({remove: function(){
@@ -336,11 +382,15 @@ function draw() {
     if (bounds.length) map.fitBounds(bounds, {padding:[40,40], maxZoom:17});
     else map.setView([53.48, -1.49], 15);
   }
+  resizeDots();
   updateBadges();
 
   function showTree(id) {
     var m = markers[id];
-    if (m) cluster.zoomToShowLayer(m, function(){ m.openPopup(); });
+    if (!m) return;
+    if (cluster) return cluster.zoomToShowLayer(m, function(){ m.openPopup(); });
+    map.setView(m.getLatLng(), Math.max(map.getZoom(), 17));
+    m.openPopup();
   }
   if (first && info.focus) showTree(info.focus);
 
@@ -365,8 +415,6 @@ function draw() {
     if (offSeason || pts.some(function(p){ return key(p) === 'rest'; })) h += item('rest');
     if (pts.some(function(p){ return key(p) === 'amey'; })) h += item('amey');
     h += '</div><div class="items shapes">' +
-      '<span class="item"><span class="dot hollow"></span>Community</span>' +
-      '<span class="item"><span class="dot hollow small"></span>Amey</span>' +
       (badges.length ? '<span class="item"><span class="flag">!</span>Newly planted, ' + FLAG_GRACE_DAYS +
         '+ days overdue</span>' : '') +
       '<button type="button" class="more" aria-expanded="' + legendOpen + '">' +
@@ -378,7 +426,7 @@ function draw() {
     h += '<div class="note">' + (info.rainError ? 'Rain data unavailable right now.' :
       'Heavy rain (' + info.rainMm + ' mm+ in 48 h) counts as a watering.' +
       (info.rain ? ' Last: ' + info.rain.when + '.' :
-        ' None in the last ' + (info.rainDays || Math.min(92, info.overdue + 7)) + ' days.')) +
+        (info.rainDays ? ' None in the last ' + info.rainDays + ' days.' : ''))) +
       '<br>Updated ' + info.updated + '</div></div>';
     d.innerHTML = h;
     var more = d.querySelector('.more');

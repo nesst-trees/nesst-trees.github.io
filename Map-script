@@ -6,18 +6,35 @@ const REPEAT_TAP_MS = 5 * 60 * 1000;
 const DEFAULT_RAIN_MM = 25;
 const RAIN_WINDOW_HOURS = 48;
 const MAP_PAGE_URL = 'https://nesst-trees.github.io/';
-// Watering season (months, inclusive); override in Summary!H3 and H4.
-// Guidance focuses on May-Aug; September is included as it can still be dry.
-const DEFAULT_SEASON = [5, 9];
-// Watering interval by tree age, as multiples of Summary!H1: weekly in the
-// first year, fortnightly in the second, monthly in the third (Cambridge City
-// Council guidance), then established. Trees without a planted date use year 1.
-const AGE_MULTIPLIERS = [1, 2, 4];
+// Watering season as [month, day] pairs, inclusive; override in Summary!H3 and
+// H4 with a day and month ("1 Apr", "15 Sep"), a date or a month name. Wide
+// enough to cover a dry spring or a dry start to September.
+const DEFAULT_SEASON = [[4, 1], [9, 15]];
+// Days between community waterings in the 1st, 2nd and 3rd summer after
+// planting; override in Summary!H7, H8 and H9. After that a tree is
+// established. Trees without a planted date count as 1st summer.
+const DEFAULT_INTERVALS = [3, 7, 14];
 const ORDINALS = ['1st', '2nd', '3rd'];
-// In drought mode (Summary!H5) intervals are multiplied by this, and established
-// trees come back onto a monthly schedule. Amey trees, which Amey waters weekly,
-// then need a community top-up on the normal (non-drought) schedule.
+// In drought mode (Summary!H5) young trees' intervals are multiplied by this,
+// and established trees need watering every DEFAULT_ESTABLISHED_DROUGHT days
+// (override in Summary!H10). Amey trees, which Amey waters weekly, then need
+// a community top-up on the normal (non-drought) schedule.
 const DROUGHT_FACTOR = 0.5;
+const DEFAULT_ESTABLISHED_DROUGHT = 28;
+// Never-watered trees rank in the list as if dry for this many days
+const NEVER_WATERED_DAYS = 7;
+// Trees sheet columns, found by their header in row 1, so columns can be moved
+// and new ones added. Case, spaces and punctuation are ignored, and any of the
+// names listed for a column works.
+const TREE_COLUMNS = {
+  id: ['Tree ID', 'ID'],
+  species: ['Species'],
+  location: ['Location'],
+  lat: ['Lat', 'Latitude'],
+  lng: ['Long', 'Lng', 'Longitude'],
+  planted: ['Planted'],
+  responsibility: ['Responsibility']
+};
 // Litres assumed when a volunteer doesn't pick an amount; override in Summary!H6
 const DEFAULT_LITRES = 5;
 // Choices on the tap page; the last one is shown as "20 L+"
@@ -55,38 +72,66 @@ function fmt(ms, pattern) {
   return Utilities.formatDate(new Date(ms), 'Europe/London', pattern || 'd MMM, HH:mm');
 }
 
-// Accepts 1-12 or a month name ("May", "September")
+const MONTH_NAMES = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+  'september', 'october', 'november', 'december'];
+
+// Accepts 1-12 or a month name, whole or shortened to 3+ letters ("May",
+// "Sept", "September")
 function parseMonth(v) {
   if (typeof v === 'number' && v >= 1 && v <= 12) return Math.round(v);
-  const i = MONTHS.indexOf(String(v).trim().slice(0, 3).replace(/^./, function(c) { return c.toUpperCase(); }));
-  return i < 0 ? null : i + 1;
+  const s = String(v).trim().toLowerCase().replace(/\.$/, '');
+  if (s.length < 3) return null;
+  for (let i = 0; i < 12; i++) if (MONTH_NAMES[i].indexOf(s) === 0) return i + 1;
+  return null;
 }
 
-function getSettings(ss) {
-  let overdue = 7, rainMm = DEFAULT_RAIN_MM;
-  let seasonStart = DEFAULT_SEASON[0], seasonEnd = DEFAULT_SEASON[1];
-  let drought = false, defaultLitres = DEFAULT_LITRES;
-  const summary = ss.getSheetByName('Summary');
-  if (summary) {
-    const v = summary.getRange('H1:H6').getValues().map(function(r) { return r[0]; });
-    if (typeof v[0] === 'number' && v[0] > 0) overdue = v[0];
-    if (typeof v[1] === 'number' && v[1] > 0) rainMm = v[1];
-    if (parseMonth(v[2]) && parseMonth(v[3])) {
-      seasonStart = parseMonth(v[2]);
-      seasonEnd = parseMonth(v[3]);
-    }
-    drought = v[4] === true || /^(on|yes|y|true)$/i.test(String(v[4]).trim());
-    if (typeof v[5] === 'number' && v[5] > 0) defaultLitres = v[5];
-  }
-  return {overdue: overdue, rainMm: rainMm, seasonStart: seasonStart, seasonEnd: seasonEnd,
-    drought: drought, defaultLitres: defaultLitres};
+function daysInMonth(month) {
+  return month === 2 ? 29 : new Date(2001, month, 0).getDate();
 }
+
+// A season start or end as [month, day]: "15 Sep", "Sep 15", a date, or a
+// month (4, "Apr", "April"), which means its 1st day for a start and its last
+// day for an end. null if blank or not understood.
+function parseSeasonDay(v, isEnd) {
+  if (v === '' || v === null || v === undefined) return null;
+  if (v instanceof Date) return [+fmt(v.getTime(), 'M'), +fmt(v.getTime(), 'd')];
+  const s = String(v).trim();
+  const dm = s.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)\.?$/i);
+  const md = s.match(/^([a-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?$/i);
+  if (dm || md) {
+    const month = parseMonth(dm ? dm[2] : md[1]), day = +(dm ? dm[1] : md[2]);
+    return month && day >= 1 && day <= daysInMonth(month) ? [month, day] : null;
+  }
+  const month = parseMonth(v);
+  return month ? [month, isEnd ? daysInMonth(month) : 1] : null;
+}
+
+// Summary!H1 (the old base interval, before H7-H10) is no longer read
+function getSettings(ss) {
+  const s = {rainMm: DEFAULT_RAIN_MM, seasonStart: DEFAULT_SEASON[0], seasonEnd: DEFAULT_SEASON[1],
+    drought: false, defaultLitres: DEFAULT_LITRES, intervals: DEFAULT_INTERVALS.slice(),
+    establishedDrought: DEFAULT_ESTABLISHED_DROUGHT};
+  const summary = ss.getSheetByName('Summary');
+  if (!summary) return s;
+  const v = summary.getRange('H1:H10').getValues().map(function(r) { return r[0]; });
+  function days(x) { return typeof x === 'number' && x >= 1 ? Math.round(x) : null; }
+  if (typeof v[1] === 'number' && v[1] > 0) s.rainMm = v[1];
+  s.seasonStart = parseSeasonDay(v[2], false) || s.seasonStart;
+  s.seasonEnd = parseSeasonDay(v[3], true) || s.seasonEnd;
+  s.drought = v[4] === true || /^(on|yes|y|true)$/i.test(String(v[4]).trim());
+  if (typeof v[5] === 'number' && v[5] > 0) s.defaultLitres = v[5];
+  s.intervals = s.intervals.map(function(d, i) { return days(v[6 + i]) || d; });
+  s.establishedDrought = days(v[9]) || s.establishedDrought;
+  return s;
+}
+
+// [month, day] as a number that sorts by date: 15 Sep = 915
+function dayKey(md) { return md[0] * 100 + md[1]; }
 
 function inSeason(settings, now) {
-  const m = +fmt(now, 'MM');
-  return settings.seasonStart <= settings.seasonEnd
-    ? m >= settings.seasonStart && m <= settings.seasonEnd
-    : m >= settings.seasonStart || m <= settings.seasonEnd;
+  const k = +fmt(now, 'MMdd');
+  const a = dayKey(settings.seasonStart), b = dayKey(settings.seasonEnd);
+  return a <= b ? k >= a && k <= b : k >= a || k <= b;
 }
 
 // Drought mode switches watering on even outside the usual season
@@ -94,14 +139,16 @@ function activeSeason(settings, now) {
   return settings.drought || inSeason(settings, now);
 }
 
-// 1st of the month the current season started (only meaningful in season)
+// The day the current season started (only meaningful in season)
 function seasonStartMs(settings, now) {
   const y = +fmt(now, 'yyyy');
-  return new Date(+fmt(now, 'MM') >= settings.seasonStart ? y : y - 1, settings.seasonStart - 1, 1).getTime();
+  const start = settings.seasonStart;
+  return new Date(+fmt(now, 'MMdd') >= dayKey(start) ? y : y - 1, start[0] - 1, start[1]).getTime();
 }
 
 function seasonLabel(settings) {
-  return MONTHS[settings.seasonStart - 1] + '\u2013' + MONTHS[settings.seasonEnd - 1];
+  function day(md) { return md[1] + ' ' + MONTHS[md[0] - 1]; }
+  return day(settings.seasonStart) + '\u2013' + day(settings.seasonEnd);
 }
 
 // A date, a planting season ("Winter 25/26") or just a year. A season counts
@@ -132,9 +179,9 @@ function treeYear(tree, now) {
 // doesn't need to water it, and rest says why ('established' or 'amey').
 function wateringInterval(tree, settings, now) {
   const year = treeYear(tree, now);
-  const young = year < AGE_MULTIPLIERS.length;
+  const young = year < settings.intervals.length;
   const age = young ? ORDINALS[year] + ' year after planting' : 'Established';
-  const normal = young ? settings.overdue * AGE_MULTIPLIERS[year] : null;
+  const normal = young ? settings.intervals[year] : null;
   const o = {days: null, rest: null, age: age};
   if (tree.amey) {
     if (!settings.drought) {
@@ -148,8 +195,7 @@ function wateringInterval(tree, settings, now) {
       o.label = 'Drought: top up every ' + normal + ' days, on top of Amey\u2019s weekly watering';
     }
   } else if (settings.drought) {
-    o.days = normal ? Math.max(1, Math.round(normal * DROUGHT_FACTOR))
-      : settings.overdue * AGE_MULTIPLIERS[AGE_MULTIPLIERS.length - 1];
+    o.days = normal ? Math.max(1, Math.round(normal * DROUGHT_FACTOR)) : settings.establishedDrought;
     o.label = 'Drought: every ' + o.days + ' days' + (normal ? ' (normally ' + normal + ')' : '');
   } else if (normal) {
     o.days = normal;
@@ -161,20 +207,51 @@ function wateringInterval(tree, settings, now) {
   return o;
 }
 
+// An error whose message is meant for whoever looks after the sheet, so the
+// map can show it
+function sheetError(message) {
+  const err = new Error(message);
+  err.forPublic = true;
+  return err;
+}
+
+function headerKey(s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+// Where each TREE_COLUMNS column is in the Trees sheet, from its header row.
+// Every column is needed: guessing a missing one could silently put trees in
+// the wrong place or on the wrong schedule.
+function treeColumns(header) {
+  const keys = header.map(headerKey);
+  const cols = {}, missing = [];
+  for (const field in TREE_COLUMNS) {
+    const found = TREE_COLUMNS[field].map(function(name) { return keys.indexOf(headerKey(name)); })
+      .filter(function(i) { return i >= 0; });
+    if (found.length) cols[field] = found[0];
+    else missing.push('"' + TREE_COLUMNS[field][0] + '"');
+  }
+  if (missing.length) {
+    throw sheetError('The Trees sheet needs ' + (missing.length > 1 ? 'columns' : 'a column') + ' headed ' +
+      missing.join(' and ') + '. Check the headers in its first row.');
+  }
+  return cols;
+}
+
 function getTrees(ss) {
   const rows = ss.getSheetByName('Trees').getDataRange().getValues();
+  const c = treeColumns(rows[0] || []);
   const trees = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
-    const id = normId(row[0]);
+    const id = normId(row[c.id]);
     if (!id) continue;
-    const responsibility = String(row[6] || '').trim();
+    const responsibility = String(row[c.responsibility] || '').trim();
+    const planted = row[c.planted];
     trees.push({
-      id: id, rawId: row[0],
-      species: String(row[1]), location: String(row[2]),
-      lat: parseFloat(row[3]), lng: parseFloat(row[4]),
-      planted: parsePlanted(row[5]),
-      plantedText: row[5] instanceof Date ? fmt(row[5].getTime(), 'd MMM yyyy') : String(row[5]).trim(),
+      id: id, rawId: row[c.id],
+      species: String(row[c.species]), location: String(row[c.location]),
+      lat: parseFloat(row[c.lat]), lng: parseFloat(row[c.lng]),
+      planted: parsePlanted(planted),
+      plantedText: planted instanceof Date ? fmt(planted.getTime(), 'd MMM yyyy') : String(planted).trim(),
       amey: /^amey\b/i.test(responsibility), responsibility: responsibility
     });
   }
@@ -251,7 +328,14 @@ function getLastSoakingRain(trees, settings) {
 }
 
 function rainLookbackDays(settings) {
-  return Math.min(92, settings.overdue * AGE_MULTIPLIERS[AGE_MULTIPLIERS.length - 1] + 7);
+  return Math.min(92, Math.max.apply(null, settings.intervals.concat(settings.establishedDrought)) + 7);
+}
+
+// How many days before due a tree shows as "due soon": 2 for weekly and
+// longer intervals, less for short ones, so a tree watered yesterday on a
+// 3-day interval isn't already amber
+function soonDays(every) {
+  return Math.min(2, Math.floor(every / 3));
 }
 
 function computeStatuses(trees, taps, rain, settings, now) {
@@ -276,14 +360,15 @@ function computeStatuses(trees, taps, rain, settings, now) {
       if (!interval.days) {
         return {status: 'rest', rest: interval.rest, due: null, urgency: 0, interval: interval.label};
       }
+      const soon = soonDays(interval.days);
       return {
-        status: days === null ? 'never'
-          : days >= interval.days ? 'overdue' : days >= interval.days - 2 ? 'soon' : 'ok',
+        status: days === null ? 'never' : days >= interval.days ? 'overdue'
+          : soon && days >= interval.days - soon ? 'soon' : 'ok',
         rest: null,
         due: last ? fmt(last + interval.days * 86400000, 'EEE d MMM') : null,
         // Share of the interval used up: 1 = due now. Younger trees have shorter
         // intervals, so they climb faster. Never-watered trees rank by age.
-        urgency: Math.round((days === null ? settings.overdue : days) / interval.days * 100) / 100,
+        urgency: Math.round((days === null ? NEVER_WATERED_DAYS : days) / interval.days * 100) / 100,
         every: interval.days, interval: interval.label
       };
     }
@@ -384,8 +469,22 @@ function mapPageUrl(treeId) {
 
 function recordWatering(e) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const trees = getTrees(ss);
   const id = normId(e.parameter.id || '');
+  let trees;
+  try {
+    trees = getTrees(ss);
+  } catch (err) {
+    // The tree list can't be read (a renamed header, say). Still log the tap,
+    // so the watering isn't lost.
+    console.error('Tap on ' + id + ' logged without the tree list: ' + err);
+    if (id) ss.getSheetByName('Log').appendRow([new Date(), String(e.parameter.id).trim()]);
+    return HtmlService.createHtmlOutput(buildConfirmHtml({
+      ok: false, logged: !!id, mapUrl: mapPageUrl(),
+      heading: id ? 'Watered — thanks!' : 'Tag not recognised',
+      lines: [id ? 'Your watering is recorded, but the tree details can’t be shown just now.'
+        : 'This tag isn’t linked to a tree, so nothing was recorded.']
+    })).addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
   const tree = trees.filter(function(t) { return t.id === id; })[0];
 
   if (!tree) {
@@ -544,7 +643,7 @@ function mapData(e) {
   return {
     points: computeStatuses(ctx.trees, ctx.taps, ctx.rain, ctx.settings, now),
     info: {
-      overdue: ctx.settings.overdue, rainMm: ctx.settings.rainMm,
+      rainMm: ctx.settings.rainMm,
       rain: ctx.rain && ctx.rain.ms ? {when: fmt(ctx.rain.ms), mm: ctx.rain.mm} : null,
       rainError: !!(ctx.rain && ctx.rain.error),
       rainDays: rainLookbackDays(ctx.settings),
@@ -559,9 +658,17 @@ function mapData(e) {
 }
 
 // JSON for the GitHub Pages map (index.html in the repo)
+// A problem with the sheet (a missing header, say) comes back as {error}, which
+// the map shows. Other errors are logged but not shown in detail.
 function renderData(e) {
-  const d = mapData(e);
-  delete d.rawRain;
+  let d;
+  try {
+    d = mapData(e);
+    delete d.rawRain;
+  } catch (err) {
+    console.error('Map data failed: ' + (err && err.stack || err));
+    d = {error: err && err.forPublic ? err.message : 'Something went wrong reading the sheet.'};
+  }
   return ContentService.createTextOutput(JSON.stringify(d))
     .setMimeType(ContentService.MimeType.JSON);
 }
@@ -675,8 +782,7 @@ document.getElementById('show').onclick = function() {
       var key = me ? 'ok' : p.status === 'rest' && p.rest === 'amey' ? 'amey' : p.status;
       var fill = !me && (key === 'soon' || key === 'overdue') && p.urgency ?
         ramp[Math.round(Math.min(1, Math.max(0, (p.urgency - 0.75) / 1.75)) * (ramp.length - 1))] : colours[key];
-      // Amey trees are smaller circles
-      L.circleMarker([p.lat, p.lng], {radius: me ? 13 : p.amey ? 5 : 8, color:'#fff', weight: me ? 3 : 2,
+      L.circleMarker([p.lat, p.lng], {radius: me ? 13 : 8, color:'#fff', weight: me ? 3 : 2,
         fillColor: fill, fillOpacity:1, interactive:false}).addTo(map);
       if (me) map.setView([p.lat, p.lng], 18);
     });
@@ -712,7 +818,7 @@ document.getElementById('show').onclick = function() {
   .undo{margin:14px 0 0;font-size:14px;color:#56645b}
   .undo button{all:unset;cursor:pointer;text-decoration:underline;color:#56645b;margin:0;padding:4px}
 </style></head><body><div class="wrap">
-  <div class="tick">${o.ok ? '\u{1F4A7}' : '\u2753'}</div>
+  <div class="tick">${o.ok || o.logged ? '\u{1F4A7}' : '\u2753'}</div>
   <h1>${o.heading}</h1>
   ${o.tree ? `<p class="tree">${o.tree.species}</p><p class="where">${o.tree.location}</p>` : ''}
   ${o.lines.map(function(l) { return '<p class="ln">' + l + '</p>'; }).join('')}
