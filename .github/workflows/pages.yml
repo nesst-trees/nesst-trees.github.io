@@ -28,19 +28,28 @@ jobs:
           node-version: 22
       - run: node .github/check-syntax.js
 
-  publish:
+  # The map is built in one job and deployed in the next, as in GitHub's own
+  # Pages workflows: by the time the deploy job starts, the uploaded artifact
+  # is ready. Deploying from the same job as the upload has failed with "No
+  # artifacts named github-pages were found".
+  build:
     # Pull requests are only checked; the map is published from main
     if: github.event_name != 'pull_request'
     needs: check
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
           path: .
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v5
